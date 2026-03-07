@@ -179,7 +179,7 @@ static uint16_t prv_read_vdd_mv(void)
 #endif
 }
 
-static int16_t prv_read_temp_x10(void)
+static int16_t prv_read_temp_x10(uint16_t vdd_mv)
 {
 #if defined(ADC_CHANNEL_TEMPSENSOR)
     uint16_t samples[UI_NODE_TEMP_SAMPLE_COUNT];
@@ -213,18 +213,19 @@ static int16_t prv_read_temp_x10(void)
     /* 정렬 후 양끝값을 버리고 중간 샘플 평균 */
     uint16_t raw_mid = prv_trimmed_mean_u16(samples, UI_NODE_TEMP_SAMPLE_COUNT, UI_NODE_TEMP_TRIM_COUNT);
 
-    uint16_t vdd_mv = prv_read_vdd_mv();
-    if (vdd_mv == 0) return (int16_t)0xFFFFu;
+    if (vdd_mv == 0u)
+    {
+        return (int16_t)0xFFFFu;
+    }
 
 #if defined(__HAL_ADC_CALC_TEMPERATURE)
-    int32_t temp_c = __HAL_ADC_CALC_TEMPERATURE(vdd_mv, raw_mid, ADC_RESOLUTION_12B);
-    /* 0.1'C */
-    return (int16_t)(temp_c * 10);
+    return (int16_t)(__HAL_ADC_CALC_TEMPERATURE(vdd_mv, raw_mid, ADC_RESOLUTION_12B) * 10);
 #else
     (void)raw_mid;
     return (int16_t)0xFFFFu;
 #endif
 #else
+    (void)vdd_mv;
     return (int16_t)0xFFFFu;
 #endif
 }
@@ -444,14 +445,18 @@ bool ND_Sensors_MeasureAll(ND_SensorResult_t* out)
      *      이렇게 하면 외부 센서 전원 ON 직후의 국부적인 발열/노이즈 영향을 줄일 수 있습니다.
      */
     {
-        uint16_t vdd_x10 = prv_read_vdd_x10();
+        uint16_t vdd_mv  = prv_read_vdd_mv();
+        uint16_t vdd_x10 = (vdd_mv == 0u) ? 0xFFFFu : (uint16_t)((vdd_mv + 50u) / 100u);
+
         if ((vdd_x10 != 0xFFFFu) && (vdd_x10 >= UI_NODE_BATT_LOW_THRESHOLD_X10))
         {
             out->batt_lvl = UI_NODE_BATT_LVL_NORMAL;
         }
-    }
 
-    out->temp_c = prv_apply_temp_offset_c(prv_temp_x10_to_temp_c(prv_read_temp_x10()));
+        out->temp_c = prv_apply_temp_offset_c(
+            prv_temp_x10_to_temp_c(prv_read_temp_x10(vdd_mv))
+        );
+    }
 
     /* 2) ADC_EN: ICM/LTC 전원 */
     prv_set_adc_en(true);
