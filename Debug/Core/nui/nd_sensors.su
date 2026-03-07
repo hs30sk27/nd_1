@@ -1,9 +1,0 @@
-../Core/nui/nd_sensors.c:20:13:prv_sort_u16	16	static
-../Core/nui/nd_sensors.c:127:13:prv_adc_read	32	static
-../Core/nui/nd_sensors.c:162:17:prv_read_vdd_mv	16	static
-../Core/nui/nd_sensors.c:289:13:prv_icm_cs	0	static
-../Core/nui/nd_sensors.c:313:13:prv_icm_spi_write	16	static
-../Core/nui/nd_sensors.c:294:13:prv_icm_spi_read	24	static
-../Core/nui/nd_sensors.c:70:16:prv_trimmed_mean_i16.constprop	16	static
-../Core/nui/nd_sensors.c:414:6:ND_Sensors_Init	0	static
-../Core/nui/nd_sensors.c:419:6:ND_Sensors_MeasureAll	648	static
