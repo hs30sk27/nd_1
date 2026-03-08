@@ -56,6 +56,7 @@ static UTIL_TIMER_Object_t s_tmr_beacon_sched;
 static UTIL_TIMER_Object_t s_tmr_reminder_sched;
 static UTIL_TIMER_Object_t s_tmr_sensor_sched;
 static UTIL_TIMER_Object_t s_tmr_tx_sched;
+static UTIL_TIMER_Object_t s_tmr_tx_watchdog;
 static UTIL_TIMER_Object_t s_tmr_led1_pulse;
 
 static volatile uint32_t s_evt_flags = 0;
@@ -64,6 +65,7 @@ static volatile uint32_t s_evt_flags = 0;
 #define ND_EVT_SENSOR_START           (1u << 2)
 #define ND_EVT_TX_START               (1u << 3)
 #define ND_EVT_REMINDER_LISTEN_START  (1u << 4)
+#define ND_EVT_TX_RECOVER             (1u << 5)
 
 static bool s_beacon_ok = false;
 static uint16_t s_beacon_cnt = 0;
@@ -79,11 +81,13 @@ static uint32_t s_last_sensor_slot_id = 0xFFFFFFFFu;
 static uint32_t s_last_tx_slot_id = 0xFFFFFFFFu;
 static uint32_t s_tx_inflight_slot_id = 0xFFFFFFFFu;
 
-#define ND_TX_IN_SLOT_DELAY_MS            (350u)
-#define ND_TX_SLOT0_EXTRA_DELAY_MS        (1050u)
-#define ND_TX_DUE_LATE_GRACE_CENTI        ((UI_SLOT_DURATION_MS / 10u) - 10u)
+#define ND_TX_IN_SLOT_DELAY_MS            (0u)
+#define ND_TX_SLOT0_EXTRA_DELAY_MS        (0u)
+/* 제시간 송신 우선: 300ms 이상 늦으면 같은 slot 송신을 포기하고 다음 cycle로 넘긴다. */
+#define ND_TX_DUE_LATE_GRACE_CENTI        (30u)
 #define ND_TX_RETRY_DELAY_MS              (80u)
 #define ND_TX_RETRY_GUARD_MS              (100u)
+#define ND_TX_WATCHDOG_MS                (4000u)
 #define ND_BOOT_RX_WINDOW_MS              (6000u)
 #define ND_BEACON_EARLY_WAKE_MS           (1000u)
 #define ND_BEACON_EARLY_WAKE_MS_2M        (500u)
@@ -132,18 +136,22 @@ static int8_t prv_apply_nd_internal_temp_comp(int8_t temp_c)
     return (int8_t)v;
 }
 
+static void prv_stop_tx_watchdog(void);
+static void prv_refresh_runtime_timers_after_tx(void);
+static void prv_force_tx_recovery(bool keep_last_slot);
+static void prv_stop_sensor_and_tx_timers(void);
+static void prv_schedule_beacon_window(void);
+static void prv_schedule_reminder_window(void);
+static void prv_schedule_sensor_and_tx(void);
+static void prv_continue_boot_listen_or_schedule(void);
+static void prv_enter_unsync_search(void);
+
 static bool s_boot_listen_active = false;
 static uint32_t s_boot_listen_deadline_ms = 0u;
 static uint32_t s_rx_window_deadline_ms = 0u;
 static ND_RxReason_t s_rx_reason = ND_RX_REASON_NONE;
 static bool s_force_gw_phase_scan = false;
 static uint8_t s_gw_phase_scan_cycle_count = 0u;
-
-static void prv_schedule_beacon_window(void);
-static void prv_schedule_reminder_window(void);
-static void prv_schedule_sensor_and_tx(void);
-static void prv_continue_boot_listen_or_schedule(void);
-static void prv_enter_unsync_search(void);
 
 static bool prv_radio_ready_for_tx(void)
 {
@@ -235,6 +243,52 @@ static void prv_tmr_tx_cb(void *context)
     (void)context;
     s_evt_flags |= ND_EVT_TX_START;
     UTIL_SEQ_SetTask(UI_TASK_BIT_ND_MAIN, 0);
+}
+
+static void prv_tmr_tx_watchdog_cb(void *context)
+{
+    (void)context;
+    s_evt_flags |= ND_EVT_TX_RECOVER;
+    UTIL_SEQ_SetTask(UI_TASK_BIT_ND_MAIN, 0);
+}
+
+static void prv_stop_tx_watchdog(void)
+{
+    (void)UTIL_TIMER_Stop(&s_tmr_tx_watchdog);
+}
+
+static void prv_start_tx_watchdog(void)
+{
+    (void)UTIL_TIMER_Stop(&s_tmr_tx_watchdog);
+    (void)UTIL_TIMER_SetPeriod(&s_tmr_tx_watchdog, ND_TX_WATCHDOG_MS);
+    (void)UTIL_TIMER_Start(&s_tmr_tx_watchdog);
+}
+
+static void prv_refresh_runtime_timers_after_tx(void)
+{
+    prv_continue_boot_listen_or_schedule();
+    if (s_runtime_enabled) {
+        prv_schedule_reminder_window();
+        prv_schedule_sensor_and_tx();
+    } else {
+        prv_stop_sensor_and_tx_timers();
+    }
+}
+
+static void prv_force_tx_recovery(bool keep_last_slot)
+{
+    prv_stop_tx_watchdog();
+    UI_Radio_MarkRecoverNeeded();
+    if (Radio.Sleep != NULL) {
+        Radio.Sleep();
+    }
+    s_state = ND_STATE_IDLE;
+    if (keep_last_slot && (s_tx_inflight_slot_id != 0xFFFFFFFFu)) {
+        s_last_tx_slot_id = s_tx_inflight_slot_id;
+    }
+    s_tx_inflight_slot_id = 0xFFFFFFFFu;
+    UI_LPM_UnlockStop();
+    prv_refresh_runtime_timers_after_tx();
 }
 
 static void prv_apply_setting_ascii(const uint8_t setting_ascii[3])
@@ -364,13 +418,8 @@ static uint32_t prv_get_tx_base_offset_sec(void)
 
 static uint32_t prv_get_tx_in_slot_delay_ms(uint8_t node_num)
 {
-    uint32_t delay_ms = ND_TX_IN_SLOT_DELAY_MS;
-
-    if (node_num == 0u) {
-        delay_ms += ND_TX_SLOT0_EXTRA_DELAY_MS;
-    }
-
-    return delay_ms;
+    (void)node_num;
+    return ND_TX_IN_SLOT_DELAY_MS;
 }
 
 static void prv_schedule_tx_event_at(uint64_t target_centi, uint8_t node_num)
@@ -637,6 +686,7 @@ static void prv_stop_sensor_and_tx_timers(void)
 {
     (void)UTIL_TIMER_Stop(&s_tmr_sensor_sched);
     (void)UTIL_TIMER_Stop(&s_tmr_tx_sched);
+    (void)UTIL_TIMER_Stop(&s_tmr_tx_watchdog);
     (void)UTIL_TIMER_Stop(&s_tmr_reminder_sched);
 }
 
@@ -1075,6 +1125,15 @@ void ND_App_Process(void)
         return;
     }
 
+    if ((ev & ND_EVT_TX_RECOVER) != 0u) {
+        s_evt_flags &= ~ND_EVT_TX_RECOVER;
+        if (s_state == ND_STATE_TX_DATA) {
+            prv_force_tx_recovery(false);
+        }
+        prv_reschedule_main_if_pending();
+        return;
+    }
+
     if ((ev & ND_EVT_SENSOR_START) != 0u) {
         s_evt_flags &= ~ND_EVT_SENSOR_START;
         uint32_t now_sec;
@@ -1106,7 +1165,8 @@ void ND_App_Process(void)
             bool measure_ok = ND_Sensors_MeasureAll(&measured);
             if (measure_ok) {
                 measured.temp_c = prv_apply_nd_internal_temp_comp(measured.temp_c);
-                if ((measured.temp_c <= UI_NODE_TEMP_MIN_C) &&
+                if (((measured.temp_c == UI_NODE_TEMP_INVALID_C) ||
+                     (measured.temp_c <= UI_NODE_TEMP_MIN_C)) &&
                     (s_sensor_ready) &&
                     (s_last_sensor.temp_c != UI_NODE_TEMP_INVALID_C) &&
                     (s_last_sensor.temp_c > UI_NODE_TEMP_MIN_C)) {
@@ -1190,6 +1250,10 @@ void ND_App_Process(void)
 
         (void)UI_Pkt_BuildNodeData(s_node_tx_payload, &nd);
         if (!prv_radio_ready_for_tx()) {
+            UI_Radio_MarkRecoverNeeded();
+            if (Radio.Sleep != NULL) {
+                Radio.Sleep();
+            }
             retry_scheduled = prv_schedule_short_tx_retry(period, tx_off);
             if (!retry_scheduled) {
                 prv_schedule_sensor_and_tx();
@@ -1198,6 +1262,10 @@ void ND_App_Process(void)
             return;
         }
         if (!UI_Radio_PrepareTx(UI_NODE_PAYLOAD_LEN)) {
+            UI_Radio_MarkRecoverNeeded();
+            if (Radio.Sleep != NULL) {
+                Radio.Sleep();
+            }
             retry_scheduled = prv_schedule_short_tx_retry(period, tx_off);
             if (!retry_scheduled) {
                 prv_schedule_sensor_and_tx();
@@ -1210,6 +1278,7 @@ void ND_App_Process(void)
         UI_LPM_LockStop();
         s_state = ND_STATE_TX_DATA;
         s_tx_inflight_slot_id = tx_slot_id;
+        prv_start_tx_watchdog();
         /* GW RX는 같은 cycle/time대에 공통 data frequency(3rd arg = 0u)를 사용한다. */
         Radio.SetChannel(UI_RF_GetDataFreqHz(freq_anchor_sec, period, 0u));
         Radio.Send(s_node_tx_payload, UI_NODE_PAYLOAD_LEN);
@@ -1232,6 +1301,7 @@ void ND_App_Init(void)
     UTIL_TIMER_Create(&s_tmr_reminder_sched, 0u, UTIL_TIMER_ONESHOT, prv_tmr_reminder_cb, NULL);
     UTIL_TIMER_Create(&s_tmr_sensor_sched, 0u, UTIL_TIMER_ONESHOT, prv_tmr_sensor_cb, NULL);
     UTIL_TIMER_Create(&s_tmr_tx_sched, 0u, UTIL_TIMER_ONESHOT, prv_tmr_tx_cb, NULL);
+    UTIL_TIMER_Create(&s_tmr_tx_watchdog, ND_TX_WATCHDOG_MS, UTIL_TIMER_ONESHOT, prv_tmr_tx_watchdog_cb, NULL);
     UTIL_TIMER_Create(&s_tmr_led1_pulse, 10u, UTIL_TIMER_ONESHOT, prv_led1_pulse_off_cb, NULL);
 
     s_state = ND_STATE_IDLE;
@@ -1258,13 +1328,7 @@ void ND_App_Init(void)
 
 void ND_Radio_OnTxDone(void)
 {
-    Radio.Sleep();
-    s_state = ND_STATE_IDLE;
-    if (s_tx_inflight_slot_id != 0xFFFFFFFFu) {
-        s_last_tx_slot_id = s_tx_inflight_slot_id;
-        s_tx_inflight_slot_id = 0xFFFFFFFFu;
-    }
-    UI_LPM_UnlockStop();
+    prv_force_tx_recovery(true);
     UTIL_SEQ_SetTask(UI_TASK_BIT_ND_MAIN, 0);
 }
 
@@ -1274,7 +1338,11 @@ void ND_Radio_OnTxTimeout(void)
     uint32_t tx_off_sec = 0u;
     bool retry_scheduled = false;
 
-    Radio.Sleep();
+    prv_stop_tx_watchdog();
+    UI_Radio_MarkRecoverNeeded();
+    if (Radio.Sleep != NULL) {
+        Radio.Sleep();
+    }
     s_state = ND_STATE_IDLE;
     s_tx_inflight_slot_id = 0xFFFFFFFFu;
     UI_LPM_UnlockStop();
@@ -1283,7 +1351,7 @@ void ND_Radio_OnTxTimeout(void)
         retry_scheduled = prv_schedule_short_tx_retry(period_sec, tx_off_sec);
     }
     if (!retry_scheduled) {
-        prv_schedule_sensor_and_tx();
+        prv_refresh_runtime_timers_after_tx();
     }
     UTIL_SEQ_SetTask(UI_TASK_BIT_ND_MAIN, 0);
 }
