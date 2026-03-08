@@ -78,7 +78,9 @@ static uint8_t s_node_tx_payload[UI_NODE_PAYLOAD_LEN];
 static uint32_t s_last_sensor_slot_id = 0xFFFFFFFFu;
 static uint32_t s_last_tx_slot_id = 0xFFFFFFFFu;
 
-#define ND_TX_IN_SLOT_DELAY_MS            (200u)
+#define ND_TX_IN_SLOT_DELAY_MS            (250u)
+#define ND_TX_SLOT0_EXTRA_DELAY_MS        (750u)
+#define ND_TX_DUE_LATE_GRACE_CENTI        (150u)
 #define ND_TX_RETRY_DELAY_MS              (100u)
 #define ND_TX_RETRY_GUARD_MS              (100u)
 #define ND_BOOT_RX_WINDOW_MS              (6000u)
@@ -316,9 +318,70 @@ static uint64_t prv_next_event_centi(uint64_t now_centi, uint32_t interval_sec, 
     return (uint64_t)next_sec * 100u;
 }
 
+static bool prv_is_event_due_now(uint64_t now_centi,
+                                 uint32_t interval_sec,
+                                 uint32_t offset_sec,
+                                 uint32_t late_grace_centi,
+                                 uint64_t *due_event_centi)
+{
+    uint64_t next_evt;
+    uint64_t step;
+    uint64_t prev_evt;
+
+    if ((interval_sec == 0u) || (due_event_centi == NULL)) {
+        return false;
+    }
+
+    next_evt = prv_next_event_centi(now_centi, interval_sec, offset_sec);
+    step = (uint64_t)interval_sec * 100u;
+
+    if (next_evt == now_centi) {
+        *due_event_centi = next_evt;
+        return true;
+    }
+    if (next_evt < step) {
+        return false;
+    }
+
+    prev_evt = next_evt - step;
+    if ((now_centi >= prev_evt) &&
+        (now_centi < (prev_evt + (uint64_t)late_grace_centi))) {
+        *due_event_centi = prev_evt;
+        return true;
+    }
+
+    return false;
+}
+
 static uint32_t prv_get_tx_base_offset_sec(void)
 {
     return 30u;
+}
+
+static uint32_t prv_get_tx_in_slot_delay_ms(uint8_t node_num)
+{
+    uint32_t delay_ms = ND_TX_IN_SLOT_DELAY_MS;
+
+    if (node_num == 0u) {
+        delay_ms += ND_TX_SLOT0_EXTRA_DELAY_MS;
+    }
+
+    return delay_ms;
+}
+
+static void prv_schedule_tx_event_at(uint64_t target_centi, uint8_t node_num)
+{
+    uint64_t now_centi = UI_Time_NowCenti2016();
+    uint32_t delay_ms = (uint32_t)((target_centi > now_centi) ? ((target_centi - now_centi) * 10u) : 1u);
+
+    delay_ms += prv_get_tx_in_slot_delay_ms(node_num);
+    if (delay_ms == 0u) {
+        delay_ms = 1u;
+    }
+
+    (void)UTIL_TIMER_Stop(&s_tmr_tx_sched);
+    (void)UTIL_TIMER_SetPeriod(&s_tmr_tx_sched, delay_ms);
+    (void)UTIL_TIMER_Start(&s_tmr_tx_sched);
 }
 
 static uint32_t prv_periodic_slot_id_from_epoch_sec(uint32_t epoch_sec, uint32_t period_sec, uint32_t offset_sec)
@@ -908,7 +971,7 @@ static void prv_schedule_sensor_and_tx(void)
     next_tx = prv_next_event_centi(now, period, tx_off);
     ds_ms = (uint32_t)((next_sensor > now) ? ((next_sensor - now) * 10u) : 1u);
     dt_ms = (uint32_t)((next_tx > now) ? ((next_tx - now) * 10u) : 1u);
-    dt_ms += ND_TX_IN_SLOT_DELAY_MS;
+    dt_ms += prv_get_tx_in_slot_delay_ms(node);
 
     (void)UTIL_TIMER_Stop(&s_tmr_sensor_sched);
     (void)UTIL_TIMER_SetPeriod(&s_tmr_sensor_sched, ds_ms);
@@ -1027,6 +1090,8 @@ void ND_App_Process(void)
         s_evt_flags &= ~ND_EVT_TX_START;
         const UI_Config_t *cfg;
         UI_NodeData_t nd;
+        uint64_t now_centi;
+        uint64_t due_tx_centi;
         uint32_t now_sec;
         uint32_t period;
         uint32_t tx_off;
@@ -1035,7 +1100,8 @@ void ND_App_Process(void)
         bool retry_scheduled;
 
         cfg = UI_GetConfig();
-        now_sec = UI_Time_NowSec2016();
+        now_centi = UI_Time_NowCenti2016();
+        now_sec = (uint32_t)(now_centi / 100u);
         period = s_test_mode ? 60u : prv_get_normal_cycle_sec();
         tx_off = prv_get_tx_base_offset_sec() + (uint32_t)cfg->node_num * 2u;
 
@@ -1044,6 +1110,13 @@ void ND_App_Process(void)
             return;
         }
 
+        if (!prv_is_event_due_now(now_centi, period, tx_off, ND_TX_DUE_LATE_GRACE_CENTI, &due_tx_centi)) {
+            prv_schedule_tx_event_at(prv_next_event_centi(now_centi, period, tx_off), cfg->node_num);
+            prv_reschedule_main_if_pending();
+            return;
+        }
+
+        now_sec = (uint32_t)(due_tx_centi / 100u);
         tx_slot_id = prv_periodic_slot_id_from_epoch_sec(now_sec, period, tx_off);
         if (tx_slot_id == s_last_tx_slot_id) {
             prv_reschedule_main_if_pending();
