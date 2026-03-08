@@ -50,6 +50,22 @@ extern void MX_SPI1_Init(void);
 #define UI_NODE_VREF_TRIM_COUNT (2u)
 #endif
 
+#ifndef UI_NODE_ADC_POWER_SETTLE_MS
+#define UI_NODE_ADC_POWER_SETTLE_MS (50u)
+#endif
+
+#ifndef UI_NODE_LTC_WARMUP_DISCARD_COUNT
+#define UI_NODE_LTC_WARMUP_DISCARD_COUNT (2u)
+#endif
+
+#ifndef UI_NODE_TEMP_SUSPECT_LOW_C
+#define UI_NODE_TEMP_SUSPECT_LOW_C ((int8_t)-40)
+#endif
+
+#ifndef UI_NODE_TEMP_SUSPECT_HIGH_C
+#define UI_NODE_TEMP_SUSPECT_HIGH_C ((int8_t)85)
+#endif
+
 static void prv_sort_u16(uint16_t *a, uint16_t n)
 {
     for (uint16_t i = 1; i < n; i++) {
@@ -183,6 +199,59 @@ static bool prv_adc_read(uint32_t channel, uint32_t sampling_time, uint16_t *out
 #endif
 }
 
+static bool prv_adc_read_quick(uint32_t channel, uint16_t *out_raw)
+{
+    return prv_adc_read(channel, UI_ADC_SAMPLINGTIME, out_raw);
+}
+
+static uint16_t prv_read_vdd_mv_quick(void)
+{
+#if defined(ADC_CHANNEL_VREFINT)
+    uint16_t raw = 0u;
+    if (!prv_adc_read_quick(ADC_CHANNEL_VREFINT, &raw)) {
+        return 0u;
+    }
+#if defined(__HAL_ADC_CALC_VREFANALOG_VOLTAGE)
+    return (uint16_t)__HAL_ADC_CALC_VREFANALOG_VOLTAGE(raw, ADC_RESOLUTION_12B);
+#else
+    (void)raw;
+    return 0u;
+#endif
+#else
+    return 0u;
+#endif
+}
+
+static int16_t prv_read_temp_x10_quick(uint16_t vdd_mv)
+{
+#if defined(ADC_CHANNEL_TEMPSENSOR)
+    uint16_t samples[UI_NODE_TEMP_SAMPLE_COUNT];
+    uint16_t raw_mid;
+
+    if (vdd_mv == 0u) {
+        return (int16_t)0xFFFFu;
+    }
+
+    for (uint32_t i = 0u; i < UI_NODE_TEMP_SAMPLE_COUNT; i++) {
+        if (!prv_adc_read_quick(ADC_CHANNEL_TEMPSENSOR, &samples[i])) {
+            return (int16_t)0xFFFFu;
+        }
+        HAL_Delay(2u);
+    }
+
+    raw_mid = prv_trimmed_mean_u16(samples, UI_NODE_TEMP_SAMPLE_COUNT, UI_NODE_TEMP_TRIM_COUNT);
+#if defined(__HAL_ADC_CALC_TEMPERATURE)
+    return (int16_t)(__HAL_ADC_CALC_TEMPERATURE(vdd_mv, raw_mid, ADC_RESOLUTION_12B) * 10);
+#else
+    (void)raw_mid;
+    return (int16_t)0xFFFFu;
+#endif
+#else
+    (void)vdd_mv;
+    return (int16_t)0xFFFFu;
+#endif
+}
+
 static uint16_t prv_read_vdd_mv(void)
 {
 #if defined(ADC_CHANNEL_VREFINT)
@@ -288,6 +357,63 @@ static int8_t prv_apply_temp_offset_c(int8_t temp_c)
         return UI_NODE_TEMP_INVALID_C;
     }
     return prv_clamp_temp_c_i16((int16_t)temp_c + (int16_t)UI_NODE_TEMP_OFFSET_C);
+}
+
+static uint16_t prv_read_vdd_x10(void);
+
+static bool prv_temp_c_looks_suspicious(int8_t temp_c)
+{
+    if (temp_c == UI_NODE_TEMP_INVALID_C) {
+        return true;
+    }
+    if (temp_c <= UI_NODE_TEMP_SUSPECT_LOW_C) {
+        return true;
+    }
+    if (temp_c >= UI_NODE_TEMP_SUSPECT_HIGH_C) {
+        return true;
+    }
+    return false;
+}
+
+static bool prv_measure_internal_primary(uint16_t *out_vdd_x10, int8_t *out_temp_c)
+{
+    uint16_t vdd_mv;
+    int16_t temp_x10;
+
+    if ((out_vdd_x10 == NULL) || (out_temp_c == NULL)) {
+        return false;
+    }
+
+    vdd_mv = prv_read_vdd_mv_quick();
+    if (vdd_mv == 0u) {
+        return false;
+    }
+
+    *out_vdd_x10 = (uint16_t)((vdd_mv + 50u) / 100u);
+    temp_x10 = prv_read_temp_x10_quick(vdd_mv);
+    *out_temp_c = prv_apply_temp_offset_c(prv_temp_x10_to_temp_c(temp_x10));
+    return (*out_temp_c != UI_NODE_TEMP_INVALID_C);
+}
+
+static bool prv_measure_internal_fallback(uint16_t *out_vdd_x10, int8_t *out_temp_c)
+{
+    uint16_t vdd_x10;
+    int8_t temp_c;
+
+    if ((out_vdd_x10 == NULL) || (out_temp_c == NULL)) {
+        return false;
+    }
+
+    vdd_x10 = prv_read_vdd_x10();
+    temp_c = prv_apply_temp_offset_c(prv_temp_x10_to_temp_c(prv_read_temp_x10()));
+
+    if (vdd_x10 == 0xFFFFu) {
+        return false;
+    }
+
+    *out_vdd_x10 = vdd_x10;
+    *out_temp_c = temp_c;
+    return (temp_c != UI_NODE_TEMP_INVALID_C);
 }
 
 static uint16_t prv_read_vdd_x10(void)
@@ -398,6 +524,15 @@ static bool prv_ltc_read_u16(uint16_t *out)
 static uint16_t prv_ltc_read_avg(void)
 {
     uint16_t s[UI_NODE_LTC_SAMPLE_COUNT];
+    uint16_t dummy = 0u;
+
+    for (uint32_t i = 0u; i < UI_NODE_LTC_WARMUP_DISCARD_COUNT; i++) {
+        if (!prv_ltc_read_u16(&dummy)) {
+            return 0xFFFFu;
+        }
+        HAL_Delay(40u);
+    }
+
     for (uint32_t i = 0u; i < UI_NODE_LTC_SAMPLE_COUNT; i++) {
         if (!prv_ltc_read_u16(&s[i])) {
             return 0xFFFFu;
@@ -414,6 +549,10 @@ void ND_Sensors_Init(void)
 
 bool ND_Sensors_MeasureAll(ND_SensorResult_t *out)
 {
+    uint16_t vdd_x10 = 0xFFFFu;
+    int8_t temp_c = UI_NODE_TEMP_INVALID_C;
+    bool internal_ok = false;
+
     if (out == NULL) {
         return false;
     }
@@ -432,17 +571,25 @@ bool ND_Sensors_MeasureAll(ND_SensorResult_t *out)
     out->adc = 0xFFFFu;
     out->pulse_cnt = UI_GPIO_GetPulseCount();
 
-    {
-        uint16_t vdd_x10 = prv_read_vdd_x10();
-        if ((vdd_x10 != 0xFFFFu) && (vdd_x10 >= UI_NODE_BATT_LOW_THRESHOLD_X10)) {
-            out->batt_lvl = UI_NODE_BATT_LVL_NORMAL;
+    /* GW와 같은 조건으로 내부 ADC를 먼저 안정화한다. */
+    prv_set_adc_en(true);
+    HAL_Delay(UI_NODE_ADC_POWER_SETTLE_MS);
+
+    internal_ok = prv_measure_internal_primary(&vdd_x10, &temp_c);
+    if ((!internal_ok) || prv_temp_c_looks_suspicious(temp_c)) {
+        uint16_t vdd_x10_fb = 0xFFFFu;
+        int8_t temp_c_fb = UI_NODE_TEMP_INVALID_C;
+        if (prv_measure_internal_fallback(&vdd_x10_fb, &temp_c_fb)) {
+            vdd_x10 = vdd_x10_fb;
+            temp_c = temp_c_fb;
+            internal_ok = !prv_temp_c_looks_suspicious(temp_c_fb);
         }
     }
 
-    out->temp_c = prv_apply_temp_offset_c(prv_temp_x10_to_temp_c(prv_read_temp_x10()));
-
-    prv_set_adc_en(true);
-    HAL_Delay(10u);
+    if ((vdd_x10 != 0xFFFFu) && (vdd_x10 >= UI_NODE_BATT_LOW_THRESHOLD_X10)) {
+        out->batt_lvl = UI_NODE_BATT_LVL_NORMAL;
+    }
+    out->temp_c = temp_c;
 
 #if defined(ICM20948_CS_Pin)
     if (prv_icm_wakeup() && prv_icm_check_whoami()) {

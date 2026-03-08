@@ -77,10 +77,11 @@ static bool s_sensor_ready = false;
 static uint8_t s_node_tx_payload[UI_NODE_PAYLOAD_LEN];
 static uint32_t s_last_sensor_slot_id = 0xFFFFFFFFu;
 static uint32_t s_last_tx_slot_id = 0xFFFFFFFFu;
+static uint32_t s_tx_inflight_slot_id = 0xFFFFFFFFu;
 
 #define ND_TX_IN_SLOT_DELAY_MS            (250u)
 #define ND_TX_SLOT0_EXTRA_DELAY_MS        (750u)
-#define ND_TX_DUE_LATE_GRACE_CENTI        (150u)
+#define ND_TX_DUE_LATE_GRACE_CENTI        ((UI_SLOT_DURATION_MS / 10u) - 10u)
 #define ND_TX_RETRY_DELAY_MS              (100u)
 #define ND_TX_RETRY_GUARD_MS              (100u)
 #define ND_BOOT_RX_WINDOW_MS              (6000u)
@@ -763,6 +764,24 @@ static bool prv_schedule_short_tx_retry(uint32_t period_sec, uint32_t tx_off_sec
     return true;
 }
 
+static bool prv_get_tx_retry_params(uint32_t *out_period_sec, uint32_t *out_tx_off_sec)
+{
+    const UI_Config_t *cfg;
+
+    if ((out_period_sec == NULL) || (out_tx_off_sec == NULL)) {
+        return false;
+    }
+
+    cfg = UI_GetConfig();
+    if (cfg == NULL) {
+        return false;
+    }
+
+    *out_period_sec = s_test_mode ? 60u : prv_get_normal_cycle_sec();
+    *out_tx_off_sec = prv_get_tx_base_offset_sec() + (uint32_t)cfg->node_num * 2u;
+    return (*out_period_sec != 0u);
+}
+
 static void prv_reschedule_main_if_pending(void)
 {
     if (s_evt_flags != 0u) {
@@ -1077,10 +1096,21 @@ void ND_App_Process(void)
             return;
         }
         s_last_sensor_slot_id = sensor_slot_id;
-        s_sensor_ready = ND_Sensors_MeasureAll(&s_last_sensor);
-        if (s_sensor_ready) {
-            s_last_sensor.temp_c = prv_apply_nd_internal_temp_comp(s_last_sensor.temp_c);
-            prv_led1_pulse_10ms();
+        {
+            ND_SensorResult_t measured = s_last_sensor;
+            bool measure_ok = ND_Sensors_MeasureAll(&measured);
+            if (measure_ok) {
+                measured.temp_c = prv_apply_nd_internal_temp_comp(measured.temp_c);
+                if ((measured.temp_c <= UI_NODE_TEMP_MIN_C) &&
+                    (s_sensor_ready) &&
+                    (s_last_sensor.temp_c != UI_NODE_TEMP_INVALID_C) &&
+                    (s_last_sensor.temp_c > UI_NODE_TEMP_MIN_C)) {
+                    measured.temp_c = s_last_sensor.temp_c;
+                }
+                s_last_sensor = measured;
+                s_sensor_ready = true;
+                prv_led1_pulse_10ms();
+            }
         }
         prv_reschedule_main_if_pending();
         return;
@@ -1105,7 +1135,16 @@ void ND_App_Process(void)
         period = s_test_mode ? 60u : prv_get_normal_cycle_sec();
         tx_off = prv_get_tx_base_offset_sec() + (uint32_t)cfg->node_num * 2u;
 
-        if (!s_runtime_enabled || !s_sensor_ready) {
+        if (!s_runtime_enabled) {
+            prv_reschedule_main_if_pending();
+            return;
+        }
+
+        if (!s_sensor_ready) {
+            retry_scheduled = prv_schedule_short_tx_retry(period, tx_off);
+            if (!retry_scheduled) {
+                prv_schedule_sensor_and_tx();
+            }
             prv_reschedule_main_if_pending();
             return;
         }
@@ -1118,7 +1157,7 @@ void ND_App_Process(void)
 
         now_sec = (uint32_t)(due_tx_centi / 100u);
         tx_slot_id = prv_periodic_slot_id_from_epoch_sec(now_sec, period, tx_off);
-        if (tx_slot_id == s_last_tx_slot_id) {
+        if ((tx_slot_id == s_last_tx_slot_id) || (tx_slot_id == s_tx_inflight_slot_id)) {
             prv_reschedule_main_if_pending();
             return;
         }
@@ -1165,7 +1204,7 @@ void ND_App_Process(void)
         freq_anchor_sec = prv_get_data_freq_anchor_sec(now_sec);
         UI_LPM_LockStop();
         s_state = ND_STATE_TX_DATA;
-        s_last_tx_slot_id = tx_slot_id;
+        s_tx_inflight_slot_id = tx_slot_id;
         /* GW RX는 같은 cycle/time대에 공통 data frequency(3rd arg = 0u)를 사용한다. */
         Radio.SetChannel(UI_RF_GetDataFreqHz(freq_anchor_sec, period, 0u));
         Radio.Send(s_node_tx_payload, UI_NODE_PAYLOAD_LEN);
@@ -1199,6 +1238,7 @@ void ND_App_Init(void)
     s_sensor_ready = false;
     s_last_sensor_slot_id = 0xFFFFFFFFu;
     s_last_tx_slot_id = 0xFFFFFFFFu;
+    s_tx_inflight_slot_id = 0xFFFFFFFFu;
     s_force_gw_phase_scan = false;
     s_gw_phase_scan_cycle_count = 0u;
     s_boot_listen_active = false;
@@ -1215,14 +1255,30 @@ void ND_Radio_OnTxDone(void)
 {
     Radio.Sleep();
     s_state = ND_STATE_IDLE;
+    if (s_tx_inflight_slot_id != 0xFFFFFFFFu) {
+        s_last_tx_slot_id = s_tx_inflight_slot_id;
+        s_tx_inflight_slot_id = 0xFFFFFFFFu;
+    }
     UI_LPM_UnlockStop();
 }
 
 void ND_Radio_OnTxTimeout(void)
 {
+    uint32_t period_sec = 0u;
+    uint32_t tx_off_sec = 0u;
+    bool retry_scheduled = false;
+
     Radio.Sleep();
     s_state = ND_STATE_IDLE;
+    s_tx_inflight_slot_id = 0xFFFFFFFFu;
     UI_LPM_UnlockStop();
+
+    if (prv_get_tx_retry_params(&period_sec, &tx_off_sec)) {
+        retry_scheduled = prv_schedule_short_tx_retry(period_sec, tx_off_sec);
+    }
+    if (!retry_scheduled) {
+        prv_schedule_sensor_and_tx();
+    }
 }
 
 void ND_Radio_OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr)
