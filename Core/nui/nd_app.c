@@ -1060,7 +1060,8 @@ void UI_Hook_OnOpKeyPressed(void)
     char msg[160];
     uint32_t pulse;
 
-    prv_led1(true);
+    /* BLE ON 중 LED는 LED0만 사용한다. LED1은 건드리지 않는다. */
+    prv_led1(false);
     (void)ND_Sensors_MeasureAll(&r);
     UI_BLE_EnableForMs(UI_BLE_ACTIVE_MS);
     UI_Time_FormatNow(ts, sizeof(ts));
@@ -1069,9 +1070,6 @@ void UI_Hook_OnOpKeyPressed(void)
                    ts, (int)r.x, (int)r.y, (int)r.z,
                    (unsigned)r.adc, (unsigned long)pulse);
     UI_UART_SendString(msg);
-    if (!UI_BLE_IsActive()) {
-        prv_led1(false);
-    }
 }
 
 void ND_App_Process(void)

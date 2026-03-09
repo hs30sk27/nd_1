@@ -36,15 +36,10 @@ static void prv_hw_set_bt(bool on)
 #endif
 }
 
-static void prv_hw_set_leds(bool on)
+static void prv_hw_set_led0(bool on)
 {
 #if UI_HAVE_LED0
     HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
-#else
-    (void)on;
-#endif
-#if UI_HAVE_LED1
-    HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
 #else
     (void)on;
 #endif
@@ -106,13 +101,13 @@ static void prv_tmr_led_cb(void *context)
     /* LED blink는 task 처리 여부와 무관하게 타이머에서 직접 토글해서 확실히 보이게 한다. */
     if (!s_ble_active) {
         s_led_on = false;
-        prv_hw_set_leds(false);
+        prv_hw_set_led0(false);
         (void)UTIL_TIMER_Stop(&s_tmr_led);
         return;
     }
 
     s_led_on = !s_led_on;
-    prv_hw_set_leds(s_led_on);
+    prv_hw_set_led0(s_led_on);
     prv_led_schedule_next();
 }
 
@@ -178,7 +173,7 @@ void UI_BLE_Init(void)
     s_bt_on_tick_ms = 0u;
     s_evt_flags = 0u;
     prv_hw_set_bt(false);
-    prv_hw_set_leds(false);
+    prv_hw_set_led0(false);
 }
 
 void UI_BLE_EnableForMs(uint32_t duration_ms)
@@ -204,7 +199,7 @@ void UI_BLE_EnableForMs(uint32_t duration_ms)
 
     /* LED blink는 재호출 때도 항상 다시 arm해서 10/490ms 패턴이 끊기지 않게 한다. */
     s_led_on = true;
-    prv_hw_set_leds(true);
+    prv_hw_set_led0(true);
     prv_led_schedule_next();
 
     (void)UTIL_TIMER_Stop(&s_tmr_timeout);
@@ -233,7 +228,7 @@ void UI_BLE_Disable(void)
     (void)UTIL_TIMER_Stop(&s_tmr_led);
     (void)UTIL_TIMER_Stop(&s_tmr_uart_init);
 
-    prv_hw_set_leds(false);
+    prv_hw_set_led0(false);
     prv_hw_set_bt(false);
 
 #if (UI_UART_DEINIT_WHEN_BLE_OFF == 1u)
@@ -271,7 +266,7 @@ void UI_BLE_ClearFlagsBeforeStop(void)
     s_uart_init_pending = false;
     s_uart_ready_deadline_ms = 0u;
     s_bt_on_tick_ms = 0u;
-    prv_hw_set_leds(false);
+    prv_hw_set_led0(false);
     prv_hw_set_bt(false);
 #if (UI_UART_DEINIT_WHEN_BLE_OFF == 1u)
     UI_UART_DeInitLowPower();
