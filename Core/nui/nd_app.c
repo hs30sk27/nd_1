@@ -412,7 +412,13 @@ static bool prv_is_event_due_now(uint64_t now_centi,
 
 static uint32_t prv_get_tx_base_offset_sec(void)
 {
-    return 30u;
+    if (s_test_mode) {
+        return 20u;
+    }
+    if (prv_is_two_minute_mode_active()) {
+        return 30u;
+    }
+    return 60u;
 }
 
 static uint32_t prv_get_tx_in_slot_delay_ms(uint8_t node_num)
@@ -1060,8 +1066,7 @@ void UI_Hook_OnOpKeyPressed(void)
     char msg[160];
     uint32_t pulse;
 
-    /* BLE ON 중 LED는 LED0만 사용한다. LED1은 건드리지 않는다. */
-    prv_led1(false);
+    prv_led1(true);
     (void)ND_Sensors_MeasureAll(&r);
     UI_BLE_EnableForMs(UI_BLE_ACTIVE_MS);
     UI_Time_FormatNow(ts, sizeof(ts));
@@ -1070,6 +1075,9 @@ void UI_Hook_OnOpKeyPressed(void)
                    ts, (int)r.x, (int)r.y, (int)r.z,
                    (unsigned)r.adc, (unsigned long)pulse);
     UI_UART_SendString(msg);
+    if (!UI_BLE_IsActive()) {
+        prv_led1(false);
+    }
 }
 
 void ND_App_Process(void)
