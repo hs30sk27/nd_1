@@ -4,82 +4,59 @@
 #include "main.h"
 #include "stm32wlxx_hal.h"
 
+#include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 
+/* 프로젝트 핸들 */
 extern ADC_HandleTypeDef hadc;
 extern SPI_HandleTypeDef hspi1;
 
+/* main.c에 생성된 Init 함수(Stop wake 후 필요할 때만 호출) */
 extern void MX_ADC_Init(void);
 extern void MX_SPI1_Init(void);
 
-#ifndef UI_ADC_INTERNAL_SAMPLINGTIME
+/* -------------------------------------------------------------------------- */
+/* 내부 온도 측정용 ADC 프로파일                                              */
+/* -------------------------------------------------------------------------- */
 #if defined(ADC_SAMPLETIME_640CYCLES_5)
-#define UI_ADC_INTERNAL_SAMPLINGTIME (ADC_SAMPLETIME_640CYCLES_5)
+#define UI_ND_ADC_INTERNAL_COMMON_SAMPLE    (ADC_SAMPLETIME_640CYCLES_5)
 #elif defined(ADC_SAMPLETIME_247CYCLES_5)
-#define UI_ADC_INTERNAL_SAMPLINGTIME (ADC_SAMPLETIME_247CYCLES_5)
+#define UI_ND_ADC_INTERNAL_COMMON_SAMPLE    (ADC_SAMPLETIME_247CYCLES_5)
 #elif defined(ADC_SAMPLETIME_160CYCLES_5)
-#define UI_ADC_INTERNAL_SAMPLINGTIME (ADC_SAMPLETIME_160CYCLES_5)
+#define UI_ND_ADC_INTERNAL_COMMON_SAMPLE    (ADC_SAMPLETIME_160CYCLES_5)
 #elif defined(ADC_SAMPLETIME_92CYCLES_5)
-#define UI_ADC_INTERNAL_SAMPLINGTIME (ADC_SAMPLETIME_92CYCLES_5)
-#elif defined(ADC_SAMPLETIME_79CYCLES_5)
-#define UI_ADC_INTERNAL_SAMPLINGTIME (ADC_SAMPLETIME_79CYCLES_5)
+#define UI_ND_ADC_INTERNAL_COMMON_SAMPLE    (ADC_SAMPLETIME_92CYCLES_5)
 #elif defined(ADC_SAMPLETIME_47CYCLES_5)
-#define UI_ADC_INTERNAL_SAMPLINGTIME (ADC_SAMPLETIME_47CYCLES_5)
-#elif defined(ADC_SAMPLETIME_39CYCLES_5)
-#define UI_ADC_INTERNAL_SAMPLINGTIME (ADC_SAMPLETIME_39CYCLES_5)
-#elif defined(ADC_SAMPLETIME_24CYCLES_5)
-#define UI_ADC_INTERNAL_SAMPLINGTIME (ADC_SAMPLETIME_24CYCLES_5)
+#define UI_ND_ADC_INTERNAL_COMMON_SAMPLE    (ADC_SAMPLETIME_47CYCLES_5)
 #else
-#define UI_ADC_INTERNAL_SAMPLINGTIME (UI_ADC_SAMPLINGTIME)
-#endif
-#endif
-
-#ifndef UI_NODE_INTERNAL_SETTLE_DELAY_MS
-#define UI_NODE_INTERNAL_SETTLE_DELAY_MS (2u)
+#define UI_ND_ADC_INTERNAL_COMMON_SAMPLE    (UI_ADC_SAMPLINGTIME)
 #endif
 
-#ifndef UI_NODE_VREF_WARMUP_COUNT
-#define UI_NODE_VREF_WARMUP_COUNT (2u)
+#if defined(ADC_CLOCK_ASYNC_DIV64)
+#define UI_ND_ADC_INTERNAL_CLOCK_PRESCALER  (ADC_CLOCK_ASYNC_DIV64)
+#elif defined(ADC_CLOCK_SYNC_PCLK_DIV4)
+#define UI_ND_ADC_INTERNAL_CLOCK_PRESCALER  (ADC_CLOCK_SYNC_PCLK_DIV4)
+#else
+#define UI_ND_ADC_INTERNAL_CLOCK_PRESCALER  (ADC_CLOCK_SYNC_PCLK_DIV1)
 #endif
 
-#ifndef UI_NODE_VREF_SAMPLE_COUNT
-#define UI_NODE_VREF_SAMPLE_COUNT (8u)
-#endif
-
-#ifndef UI_NODE_VREF_TRIM_COUNT
-#define UI_NODE_VREF_TRIM_COUNT (2u)
-#endif
-
-#ifndef UI_NODE_ADC_POWER_SETTLE_MS
-#define UI_NODE_ADC_POWER_SETTLE_MS (120u)
-#endif
-
-#ifndef UI_NODE_LTC_WARMUP_DISCARD_COUNT
-#define UI_NODE_LTC_WARMUP_DISCARD_COUNT (6u)
-#endif
-
-#ifndef UI_NODE_TEMP_SUSPECT_LOW_C
-#define UI_NODE_TEMP_SUSPECT_LOW_C ((int8_t)-40)
-#endif
-
-#ifndef UI_NODE_TEMP_SUSPECT_HIGH_C
-#define UI_NODE_TEMP_SUSPECT_HIGH_C ((int8_t)85)
-#endif
-
-#ifndef UI_NODE_TEMP_GW_STYLE_RETRY_COUNT
-#define UI_NODE_TEMP_GW_STYLE_RETRY_COUNT (3u)
-#endif
-
-#ifndef UI_NODE_TEMP_GW_STYLE_RETRY_DELAY_MS
-#define UI_NODE_TEMP_GW_STYLE_RETRY_DELAY_MS (5u)
-#endif
+#define UI_ND_TEMP_VREF_SAMPLE_COUNT        (5u)
+#define UI_ND_TEMP_VREF_TRIM_COUNT          (1u)
+#define UI_ND_TEMP_RAW_MIN_VALID            (16u)
+#define UI_ND_TEMP_RAW_MAX_VALID            (4080u)
+#define UI_ND_VDD_MIN_VALID_MV              (1800u)
+#define UI_ND_VDD_MAX_VALID_MV              (3600u)
+#define UI_ND_TEMP_STARTUP_DELAY_MS         (2u)
 
 static int8_t s_last_valid_temp_c = UI_NODE_TEMP_INVALID_C;
-static uint16_t s_last_valid_vdd_x10 = 0xFFFFu;
 
-static void prv_sort_u16(uint16_t *a, uint16_t n)
+/* -------------------------------------------------------------------------- */
+/* 유틸: 정렬 + 트림 평균                                                     */
+/* -------------------------------------------------------------------------- */
+static void prv_sort_u16(uint16_t* a, uint16_t n)
 {
-    for (uint16_t i = 1; i < n; i++) {
+    for (uint16_t i = 1u; i < n; i++) {
         uint16_t key = a[i];
         int j = (int)i - 1;
         while ((j >= 0) && (a[j] > key)) {
@@ -90,9 +67,9 @@ static void prv_sort_u16(uint16_t *a, uint16_t n)
     }
 }
 
-static void prv_sort_i16(int16_t *a, uint16_t n)
+static void prv_sort_i16(int16_t* a, uint16_t n)
 {
-    for (uint16_t i = 1; i < n; i++) {
+    for (uint16_t i = 1u; i < n; i++) {
         int16_t key = a[i];
         int j = (int)i - 1;
         while ((j >= 0) && (a[j] > key)) {
@@ -103,24 +80,22 @@ static void prv_sort_i16(int16_t *a, uint16_t n)
     }
 }
 
-static uint16_t prv_trimmed_mean_u16(uint16_t *a, uint16_t n, uint16_t trim_each_side)
+static uint16_t prv_trimmed_mean_u16(uint16_t* a, uint16_t n, uint16_t trim_each_side)
 {
-    uint16_t start;
-    uint16_t end;
-    uint32_t sum = 0u;
-    uint32_t cnt = 0u;
-
     if (n == 0u) {
         return 0xFFFFu;
     }
 
     prv_sort_u16(a, n);
-    start = trim_each_side;
-    end = (uint16_t)(n - trim_each_side);
+
+    uint16_t start = trim_each_side;
+    uint16_t end = (uint16_t)(n - trim_each_side);
     if (end <= start) {
         return a[n / 2u];
     }
 
+    uint32_t sum = 0u;
+    uint32_t cnt = 0u;
     for (uint16_t i = start; i < end; i++) {
         sum += a[i];
         cnt++;
@@ -129,24 +104,22 @@ static uint16_t prv_trimmed_mean_u16(uint16_t *a, uint16_t n, uint16_t trim_each
     return (cnt == 0u) ? a[n / 2u] : (uint16_t)(sum / cnt);
 }
 
-static int16_t prv_trimmed_mean_i16(int16_t *a, uint16_t n, uint16_t trim_each_side)
+static int16_t prv_trimmed_mean_i16(int16_t* a, uint16_t n, uint16_t trim_each_side)
 {
-    uint16_t start;
-    uint16_t end;
-    int32_t sum = 0;
-    uint32_t cnt = 0u;
-
     if (n == 0u) {
         return (int16_t)0xFFFFu;
     }
 
     prv_sort_i16(a, n);
-    start = trim_each_side;
-    end = (uint16_t)(n - trim_each_side);
+
+    uint16_t start = trim_each_side;
+    uint16_t end = (uint16_t)(n - trim_each_side);
     if (end <= start) {
         return a[n / 2u];
     }
 
+    int32_t sum = 0;
+    uint32_t cnt = 0u;
     for (uint16_t i = start; i < end; i++) {
         sum += a[i];
         cnt++;
@@ -155,6 +128,9 @@ static int16_t prv_trimmed_mean_i16(int16_t *a, uint16_t n, uint16_t trim_each_s
     return (cnt == 0u) ? a[n / 2u] : (int16_t)(sum / (int32_t)cnt);
 }
 
+/* -------------------------------------------------------------------------- */
+/* ADC_EN 전원 스위치                                                         */
+/* -------------------------------------------------------------------------- */
 static void prv_set_adc_en(bool on)
 {
 #if defined(ADC_EN_Pin)
@@ -164,6 +140,9 @@ static void prv_set_adc_en(bool on)
 #endif
 }
 
+/* -------------------------------------------------------------------------- */
+/* Init Ensure (Stop wake 이후 필요한 주변장치만 Init)                        */
+/* -------------------------------------------------------------------------- */
 static void prv_ensure_adc_init(void)
 {
 #if defined(HAL_ADC_MODULE_ENABLED)
@@ -182,155 +161,185 @@ static void prv_ensure_spi_init(void)
 #endif
 }
 
-static bool prv_adc_read(uint32_t channel, uint32_t sampling_time, uint16_t *out_raw)
+static bool prv_prepare_internal_adc_profile(void)
+{
+#if defined(HAL_ADC_MODULE_ENABLED)
+    bool changed = false;
+
+    prv_ensure_adc_init();
+
+    if (hadc.Init.ClockPrescaler != UI_ND_ADC_INTERNAL_CLOCK_PRESCALER) {
+        hadc.Init.ClockPrescaler = UI_ND_ADC_INTERNAL_CLOCK_PRESCALER;
+        changed = true;
+    }
+
+    if (hadc.Init.SamplingTimeCommon1 != UI_ND_ADC_INTERNAL_COMMON_SAMPLE) {
+        hadc.Init.SamplingTimeCommon1 = UI_ND_ADC_INTERNAL_COMMON_SAMPLE;
+        changed = true;
+    }
+
+    if (hadc.Init.SamplingTimeCommon2 != UI_ND_ADC_INTERNAL_COMMON_SAMPLE) {
+        hadc.Init.SamplingTimeCommon2 = UI_ND_ADC_INTERNAL_COMMON_SAMPLE;
+        changed = true;
+    }
+
+    if (changed) {
+        (void)HAL_ADC_DeInit(&hadc);
+        if (HAL_ADC_Init(&hadc) != HAL_OK) {
+            return false;
+        }
+    }
+
+    HAL_Delay(UI_ND_TEMP_STARTUP_DELAY_MS);
+    return true;
+#else
+    return false;
+#endif
+}
+
+/* -------------------------------------------------------------------------- */
+/* 내부 ADC (VREFINT/TEMPSENSOR)                                              */
+/* -------------------------------------------------------------------------- */
+static bool prv_adc_read_internal(uint32_t channel, uint16_t* out_raw)
 {
 #if defined(HAL_ADC_MODULE_ENABLED)
     ADC_ChannelConfTypeDef sConfig = {0};
+
+    if (out_raw == NULL) {
+        return false;
+    }
+
     sConfig.Channel = channel;
     sConfig.Rank = ADC_REGULAR_RANK_1;
-    sConfig.SamplingTime = sampling_time;
+#if defined(ADC_SAMPLINGTIME_COMMON_1)
+    sConfig.SamplingTime = ADC_SAMPLINGTIME_COMMON_1;
+#else
+    sConfig.SamplingTime = UI_ND_ADC_INTERNAL_COMMON_SAMPLE;
+#endif
+
     if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK) {
         return false;
     }
+
     if (HAL_ADC_Start(&hadc) != HAL_OK) {
         return false;
     }
-    if (HAL_ADC_PollForConversion(&hadc, 50) != HAL_OK) {
+
+    if (HAL_ADC_PollForConversion(&hadc, 50u) != HAL_OK) {
         (void)HAL_ADC_Stop(&hadc);
         return false;
     }
+
     *out_raw = (uint16_t)HAL_ADC_GetValue(&hadc);
     (void)HAL_ADC_Stop(&hadc);
     return true;
 #else
     (void)channel;
-    (void)sampling_time;
     (void)out_raw;
     return false;
 #endif
 }
 
-static bool prv_adc_read_quick(uint32_t channel, uint16_t *out_raw)
+static bool prv_read_vdd_mv_filtered(uint16_t* out_vdd_mv)
 {
-    return prv_adc_read(channel, UI_ADC_SAMPLINGTIME, out_raw);
-}
+#if defined(ADC_CHANNEL_VREFINT) && defined(__HAL_ADC_CALC_VREFANALOG_VOLTAGE)
+    uint16_t samples[UI_ND_TEMP_VREF_SAMPLE_COUNT];
 
-static uint16_t prv_read_vdd_mv_quick(void)
-{
-#if defined(ADC_CHANNEL_VREFINT)
-    uint16_t raw = 0u;
-    if (!prv_adc_read_quick(ADC_CHANNEL_VREFINT, &raw)) {
-        return 0u;
+    if (out_vdd_mv == NULL) {
+        return false;
     }
-#if defined(__HAL_ADC_CALC_VREFANALOG_VOLTAGE)
-    return (uint16_t)__HAL_ADC_CALC_VREFANALOG_VOLTAGE(raw, ADC_RESOLUTION_12B);
+
+    for (uint32_t i = 0u; i < UI_ND_TEMP_VREF_SAMPLE_COUNT; i++) {
+        uint16_t raw = 0u;
+        if (!prv_adc_read_internal(ADC_CHANNEL_VREFINT, &raw)) {
+            return false;
+        }
+        if ((raw < UI_ND_TEMP_RAW_MIN_VALID) || (raw > UI_ND_TEMP_RAW_MAX_VALID)) {
+            return false;
+        }
+        samples[i] = raw;
+        HAL_Delay(1u);
+    }
+
+    uint16_t raw_mid = prv_trimmed_mean_u16(samples,
+                                            UI_ND_TEMP_VREF_SAMPLE_COUNT,
+                                            UI_ND_TEMP_VREF_TRIM_COUNT);
+    uint32_t vdd_mv = __HAL_ADC_CALC_VREFANALOG_VOLTAGE(raw_mid, ADC_RESOLUTION_12B);
+    if ((vdd_mv < UI_ND_VDD_MIN_VALID_MV) || (vdd_mv > UI_ND_VDD_MAX_VALID_MV)) {
+        return false;
+    }
+
+    *out_vdd_mv = (uint16_t)vdd_mv;
+    return true;
 #else
-    (void)raw;
-    return 0u;
-#endif
-#else
-    return 0u;
+    (void)out_vdd_mv;
+    return false;
 #endif
 }
 
-static int16_t prv_read_temp_x10_quick(uint16_t vdd_mv)
+static bool prv_read_temp_x10_internal(int16_t* out_temp_x10)
 {
-#if defined(ADC_CHANNEL_TEMPSENSOR)
+#if defined(ADC_CHANNEL_TEMPSENSOR) && defined(__HAL_ADC_CALC_TEMPERATURE)
     uint16_t samples[UI_NODE_TEMP_SAMPLE_COUNT];
-    uint16_t raw_mid;
+    uint16_t vdd_mv = 0u;
 
-    if (vdd_mv == 0u) {
-        return (int16_t)0xFFFFu;
+    if (out_temp_x10 == NULL) {
+        return false;
     }
 
-    for (uint32_t i = 0u; i < UI_NODE_TEMP_SAMPLE_COUNT; i++) {
-        if (!prv_adc_read_quick(ADC_CHANNEL_TEMPSENSOR, &samples[i])) {
-            return (int16_t)0xFFFFu;
-        }
-        HAL_Delay(2u);
+    /*
+     * MCU 내부 온도는 외부 센서와 무관하므로 가장 먼저 읽는다.
+     * ND 보드는 main.c 기본 ADC 설정이 빠른 쪽(짧은 sample time / 빠른 clock)이라
+     * 내부 채널(VREFINT/TEMPSENSOR)에서 과소 샘플링이 나올 수 있으므로, 여기서
+     * 내부 채널 전용 프로파일로 재설정한 뒤 측정한다.
+     */
+    prv_set_adc_en(false);
+    HAL_Delay(UI_ND_TEMP_STARTUP_DELAY_MS);
+
+    if (!prv_prepare_internal_adc_profile()) {
+        return false;
     }
 
-    raw_mid = prv_trimmed_mean_u16(samples, UI_NODE_TEMP_SAMPLE_COUNT, UI_NODE_TEMP_TRIM_COUNT);
-#if defined(__HAL_ADC_CALC_TEMPERATURE)
-    return (int16_t)(__HAL_ADC_CALC_TEMPERATURE(vdd_mv, raw_mid, ADC_RESOLUTION_12B) * 10);
-#else
-    (void)raw_mid;
-    return (int16_t)0xFFFFu;
-#endif
-#else
-    (void)vdd_mv;
-    return (int16_t)0xFFFFu;
-#endif
-}
-
-static uint16_t prv_read_vdd_mv(void)
-{
-#if defined(ADC_CHANNEL_VREFINT)
-    uint16_t samples[UI_NODE_VREF_SAMPLE_COUNT];
-
-    for (uint32_t i = 0u; i < UI_NODE_VREF_WARMUP_COUNT; i++) {
-        uint16_t raw_dummy = 0u;
-        if (!prv_adc_read(ADC_CHANNEL_VREFINT, UI_ADC_INTERNAL_SAMPLINGTIME, &raw_dummy)) {
-            return 0u;
-        }
-        HAL_Delay(UI_NODE_INTERNAL_SETTLE_DELAY_MS);
+    if (!prv_read_vdd_mv_filtered(&vdd_mv)) {
+        return false;
     }
-
-    for (uint32_t i = 0u; i < UI_NODE_VREF_SAMPLE_COUNT; i++) {
-        if (!prv_adc_read(ADC_CHANNEL_VREFINT, UI_ADC_INTERNAL_SAMPLINGTIME, &samples[i])) {
-            return 0u;
-        }
-        HAL_Delay(UI_NODE_INTERNAL_SETTLE_DELAY_MS);
-    }
-
-    uint16_t raw = prv_trimmed_mean_u16(samples, UI_NODE_VREF_SAMPLE_COUNT, UI_NODE_VREF_TRIM_COUNT);
-#if defined(__HAL_ADC_CALC_VREFANALOG_VOLTAGE)
-    return (uint16_t)__HAL_ADC_CALC_VREFANALOG_VOLTAGE(raw, ADC_RESOLUTION_12B);
-#else
-    (void)raw;
-    return 0u;
-#endif
-#else
-    return 0u;
-#endif
-}
-
-static int16_t prv_read_temp_x10(void)
-{
-#if defined(ADC_CHANNEL_TEMPSENSOR)
-    uint16_t samples[UI_NODE_TEMP_SAMPLE_COUNT];
-    uint16_t vdd_mv;
-    uint16_t raw_mid;
 
     for (uint32_t i = 0u; i < UI_NODE_TEMP_WARMUP_COUNT; i++) {
         uint16_t raw_dummy = 0u;
-        if (!prv_adc_read(ADC_CHANNEL_TEMPSENSOR, UI_ADC_INTERNAL_SAMPLINGTIME, &raw_dummy)) {
-            return (int16_t)0xFFFFu;
+        if (!prv_adc_read_internal(ADC_CHANNEL_TEMPSENSOR, &raw_dummy)) {
+            return false;
         }
         HAL_Delay(UI_NODE_TEMP_WARMUP_DELAY_MS);
     }
 
     for (uint32_t i = 0u; i < UI_NODE_TEMP_SAMPLE_COUNT; i++) {
-        if (!prv_adc_read(ADC_CHANNEL_TEMPSENSOR, UI_ADC_INTERNAL_SAMPLINGTIME, &samples[i])) {
-            return (int16_t)0xFFFFu;
+        uint16_t raw = 0u;
+        if (!prv_adc_read_internal(ADC_CHANNEL_TEMPSENSOR, &raw)) {
+            return false;
         }
-        HAL_Delay(UI_NODE_INTERNAL_SETTLE_DELAY_MS);
+        if ((raw < UI_ND_TEMP_RAW_MIN_VALID) || (raw > UI_ND_TEMP_RAW_MAX_VALID)) {
+            return false;
+        }
+        samples[i] = raw;
+        HAL_Delay(2u);
     }
 
-    raw_mid = prv_trimmed_mean_u16(samples, UI_NODE_TEMP_SAMPLE_COUNT, UI_NODE_TEMP_TRIM_COUNT);
-    vdd_mv = prv_read_vdd_mv();
-    if (vdd_mv == 0u) {
-        return (int16_t)0xFFFFu;
+    uint16_t raw_mid = prv_trimmed_mean_u16(samples,
+                                            UI_NODE_TEMP_SAMPLE_COUNT,
+                                            UI_NODE_TEMP_TRIM_COUNT);
+    if ((raw_mid < UI_ND_TEMP_RAW_MIN_VALID) || (raw_mid > UI_ND_TEMP_RAW_MAX_VALID)) {
+        return false;
     }
 
-#if defined(__HAL_ADC_CALC_TEMPERATURE)
-    return (int16_t)(__HAL_ADC_CALC_TEMPERATURE(vdd_mv, raw_mid, ADC_RESOLUTION_12B) * 10);
+    {
+        int32_t temp_c = __HAL_ADC_CALC_TEMPERATURE(vdd_mv, raw_mid, ADC_RESOLUTION_12B);
+        *out_temp_x10 = (int16_t)(temp_c * 10);
+    }
+
+    return true;
 #else
-    (void)raw_mid;
-    return (int16_t)0xFFFFu;
-#endif
-#else
-    return (int16_t)0xFFFFu;
+    (void)out_temp_x10;
+    return false;
 #endif
 }
 
@@ -345,12 +354,16 @@ static int8_t prv_clamp_temp_c_i16(int16_t temp_c)
     return (int8_t)temp_c;
 }
 
-static int8_t prv_temp_x10_to_temp_c(int16_t temp_x10)
+static bool prv_temp_x10_to_temp_c_checked(int16_t temp_x10, int8_t* out_temp_c)
 {
-    int16_t temp_c;
+    int16_t temp_c = 0;
+
+    if (out_temp_c == NULL) {
+        return false;
+    }
 
     if ((uint16_t)temp_x10 == 0xFFFFu) {
-        return UI_NODE_TEMP_INVALID_C;
+        return false;
     }
 
     if (temp_x10 >= 0) {
@@ -359,7 +372,12 @@ static int8_t prv_temp_x10_to_temp_c(int16_t temp_x10)
         temp_c = (int16_t)((temp_x10 - 5) / 10);
     }
 
-    return prv_clamp_temp_c_i16(temp_c);
+    if ((temp_c < (int16_t)UI_NODE_TEMP_MIN_C) || (temp_c > (int16_t)UI_NODE_TEMP_MAX_C)) {
+        return false;
+    }
+
+    *out_temp_c = (int8_t)temp_c;
+    return true;
 }
 
 static int8_t prv_apply_temp_offset_c(int8_t temp_c)
@@ -370,217 +388,32 @@ static int8_t prv_apply_temp_offset_c(int8_t temp_c)
     return prv_clamp_temp_c_i16((int16_t)temp_c + (int16_t)UI_NODE_TEMP_OFFSET_C);
 }
 
-static uint16_t prv_read_vdd_x10(void);
-
-static bool prv_temp_c_looks_suspicious(int8_t temp_c)
-{
-    if (temp_c == UI_NODE_TEMP_INVALID_C) {
-        return true;
-    }
-    if (temp_c <= UI_NODE_TEMP_SUSPECT_LOW_C) {
-        return true;
-    }
-    if (temp_c >= UI_NODE_TEMP_SUSPECT_HIGH_C) {
-        return true;
-    }
-    return false;
-}
-
-static void prv_prepare_internal_adc_channels(void)
-{
-#if defined(__HAL_RCC_SYSCFG_CLK_ENABLE)
-    __HAL_RCC_SYSCFG_CLK_ENABLE();
-#endif
-#if defined(HAL_ADCEx_EnableVREFINT)
-    HAL_ADCEx_EnableVREFINT();
-#endif
-#if defined(HAL_ADCEx_EnableTemperatureSensor)
-    HAL_ADCEx_EnableTemperatureSensor();
-#endif
-#if defined(HAL_SYSCFG_EnableVREFINT)
-    HAL_SYSCFG_EnableVREFINT();
-#endif
-    HAL_Delay(UI_NODE_INTERNAL_SETTLE_DELAY_MS);
-}
-
-static void prv_refresh_internal_adc_path(void)
-{
-#if defined(HAL_ADC_MODULE_ENABLED)
-    (void)HAL_ADC_DeInit(&hadc);
-#endif
-    prv_ensure_adc_init();
-    prv_prepare_internal_adc_channels();
-}
-
-static bool prv_measure_internal_stable(uint16_t *out_vdd_x10, int8_t *out_temp_c)
-{
-    uint16_t vdd_x10;
-    int8_t temp_c;
-
-    if ((out_vdd_x10 == NULL) || (out_temp_c == NULL)) {
-        return false;
-    }
-
-    *out_vdd_x10 = 0xFFFFu;
-    *out_temp_c = UI_NODE_TEMP_INVALID_C;
-
-    prv_ensure_adc_init();
-    prv_prepare_internal_adc_channels();
-
-    for (uint32_t attempt = 0u; attempt < 3u; attempt++) {
-        if (attempt != 0u) {
-            HAL_Delay(UI_NODE_INTERNAL_SETTLE_DELAY_MS + 1u);
-            prv_prepare_internal_adc_channels();
-        }
-
-        vdd_x10 = prv_read_vdd_x10();
-        temp_c = prv_apply_temp_offset_c(prv_temp_x10_to_temp_c(prv_read_temp_x10()));
-
-        if ((vdd_x10 != 0xFFFFu) && (temp_c != UI_NODE_TEMP_INVALID_C)) {
-            *out_vdd_x10 = vdd_x10;
-            *out_temp_c = temp_c;
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static bool prv_read_vdd_mv_gw_style(uint16_t *out_vdd_mv)
-{
-#if defined(ADC_CHANNEL_VREFINT) && defined(__HAL_ADC_CALC_VREFANALOG_VOLTAGE)
-    uint16_t raw = 0u;
-
-    if ((out_vdd_mv == NULL) || !prv_adc_read(ADC_CHANNEL_VREFINT, UI_ADC_SAMPLINGTIME, &raw)) {
-        return false;
-    }
-    if ((raw == 0u) || (raw >= 0x0FFFu)) {
-        return false;
-    }
-
-    *out_vdd_mv = (uint16_t)__HAL_ADC_CALC_VREFANALOG_VOLTAGE(raw, ADC_RESOLUTION_12B);
-    return (*out_vdd_mv != 0u);
-#else
-    (void)out_vdd_mv;
-    return false;
-#endif
-}
-
-static bool prv_read_temp_x10_gw_style(uint16_t vdd_mv, int16_t *out_temp_x10)
-{
-#if defined(ADC_CHANNEL_TEMPSENSOR) && defined(__HAL_ADC_CALC_TEMPERATURE)
-    uint16_t samples[10];
-    uint16_t raw_mid;
-
-    if ((out_temp_x10 == NULL) || (vdd_mv == 0u)) {
-        return false;
-    }
-
-    for (uint32_t i = 0u; i < 10u; i++) {
-        if (!prv_adc_read(ADC_CHANNEL_TEMPSENSOR, UI_ADC_SAMPLINGTIME, &samples[i])) {
-            return false;
-        }
-        if ((samples[i] == 0u) || (samples[i] >= 0x0FFFu)) {
-            return false;
-        }
-        HAL_Delay(2u);
-    }
-
-    raw_mid = prv_trimmed_mean_u16(samples, 10u, 2u);
-    if ((raw_mid == 0u) || (raw_mid >= 0x0FFFu)) {
-        return false;
-    }
-    *out_temp_x10 = (int16_t)(__HAL_ADC_CALC_TEMPERATURE(vdd_mv, raw_mid, ADC_RESOLUTION_12B) * 10);
-    return true;
-#else
-    (void)vdd_mv;
-    (void)out_temp_x10;
-    return false;
-#endif
-}
-
-static bool prv_measure_internal_primary(uint16_t *out_vdd_x10, int8_t *out_temp_c)
-{
-    uint16_t vdd_mv = 0u;
-    int16_t temp_x10 = (int16_t)0xFFFFu;
-    int8_t temp_c = UI_NODE_TEMP_INVALID_C;
-
-    if ((out_vdd_x10 == NULL) || (out_temp_c == NULL)) {
-        return false;
-    }
-
-    *out_vdd_x10 = 0xFFFFu;
-    *out_temp_c = UI_NODE_TEMP_INVALID_C;
-
-    for (uint32_t attempt = 0u; attempt < UI_NODE_TEMP_GW_STYLE_RETRY_COUNT; attempt++) {
-        prv_refresh_internal_adc_path();
-        if (!prv_read_vdd_mv_gw_style(&vdd_mv) || (vdd_mv == 0u)) {
-            HAL_Delay(UI_NODE_TEMP_GW_STYLE_RETRY_DELAY_MS);
-            continue;
-        }
-
-        *out_vdd_x10 = (uint16_t)((vdd_mv + 50u) / 100u);
-        if (!prv_read_temp_x10_gw_style(vdd_mv, &temp_x10)) {
-            HAL_Delay(UI_NODE_TEMP_GW_STYLE_RETRY_DELAY_MS);
-            continue;
-        }
-
-        temp_c = prv_apply_temp_offset_c(prv_temp_x10_to_temp_c(temp_x10));
-        if (prv_temp_c_looks_suspicious(temp_c)) {
-            HAL_Delay(UI_NODE_TEMP_GW_STYLE_RETRY_DELAY_MS);
-            continue;
-        }
-
-        *out_temp_c = temp_c;
-        return true;
-    }
-
-    return false;
-}
-
-static bool prv_measure_internal_fallback(uint16_t *out_vdd_x10, int8_t *out_temp_c)
-{
-    uint16_t vdd_x10;
-    int8_t temp_c;
-
-    if ((out_vdd_x10 == NULL) || (out_temp_c == NULL)) {
-        return false;
-    }
-
-    *out_vdd_x10 = 0xFFFFu;
-    *out_temp_c = UI_NODE_TEMP_INVALID_C;
-
-    prv_refresh_internal_adc_path();
-    vdd_x10 = prv_read_vdd_x10();
-    temp_c = prv_apply_temp_offset_c(prv_temp_x10_to_temp_c(prv_read_temp_x10()));
-
-    if ((vdd_x10 == 0xFFFFu) || prv_temp_c_looks_suspicious(temp_c)) {
-        return false;
-    }
-
-    *out_vdd_x10 = vdd_x10;
-    *out_temp_c = temp_c;
-    return true;
-}
-
 static uint16_t prv_read_vdd_x10(void)
 {
-    uint16_t vdd_mv = prv_read_vdd_mv();
-    if (vdd_mv == 0u) {
+    uint16_t vdd_mv = 0u;
+    if (!prv_read_vdd_mv_filtered(&vdd_mv)) {
         return 0xFFFFu;
     }
+
+    /* 0.1V = 100mV */
     return (uint16_t)((vdd_mv + 50u) / 100u);
 }
 
+/* -------------------------------------------------------------------------- */
+/* ICM20948 (SPI)                                                             */
+/* -------------------------------------------------------------------------- */
 #if defined(ICM20948_CS_Pin)
-static void prv_icm_cs(bool on)
+static void prv_icm_cs(bool on) /* on=true: CS low */
 {
-    HAL_GPIO_WritePin(ICM20948_CS_GPIO_Port, ICM20948_CS_Pin, on ? GPIO_PIN_RESET : GPIO_PIN_SET);
+    HAL_GPIO_WritePin(ICM20948_CS_GPIO_Port,
+                      ICM20948_CS_Pin,
+                      on ? GPIO_PIN_RESET : GPIO_PIN_SET);
 }
 
-static bool prv_icm_spi_read(uint8_t reg, uint8_t *buf, uint16_t len)
+static bool prv_icm_spi_read(uint8_t reg, uint8_t* buf, uint16_t len)
 {
     uint8_t addr = (uint8_t)(reg | 0x80u);
+
     prv_icm_cs(true);
     if (HAL_SPI_Transmit(&hspi1, &addr, 1u, 50u) != HAL_OK) {
         prv_icm_cs(false);
@@ -597,6 +430,7 @@ static bool prv_icm_spi_read(uint8_t reg, uint8_t *buf, uint16_t len)
 static bool prv_icm_spi_write(uint8_t reg, uint8_t val)
 {
     uint8_t tx[2] = { (uint8_t)(reg & 0x7Fu), val };
+
     prv_icm_cs(true);
     HAL_StatusTypeDef st = HAL_SPI_Transmit(&hspi1, tx, 2u, 50u);
     prv_icm_cs(false);
@@ -623,47 +457,59 @@ static bool prv_icm_wakeup(void)
 static bool prv_icm_check_whoami(void)
 {
     uint8_t who = 0u;
+
     if (!prv_icm_select_bank(0u)) {
         return false;
     }
     if (!prv_icm_spi_read(0x00u, &who, 1u)) {
         return false;
     }
+
     return (who == 0xEAu);
 }
 
-static bool prv_icm_read_accel(int16_t *x, int16_t *y, int16_t *z)
+static bool prv_icm_read_accel(int16_t* x, int16_t* y, int16_t* z)
 {
     uint8_t b[6];
+
     if (!prv_icm_select_bank(0u)) {
         return false;
     }
     if (!prv_icm_spi_read(0x2Du, b, 6u)) {
         return false;
     }
+
     *x = (int16_t)(((uint16_t)b[0] << 8) | b[1]);
     *y = (int16_t)(((uint16_t)b[2] << 8) | b[3]);
     *z = (int16_t)(((uint16_t)b[4] << 8) | b[5]);
     return true;
 }
-#endif
+#endif /* ICM20948_CS_Pin */
 
+/* -------------------------------------------------------------------------- */
+/* LTC2450 (SPI) 외부 ADC                                                     */
+/* -------------------------------------------------------------------------- */
 #if defined(ADC_CS_Pin)
-static void prv_ltc_cs(bool on)
+static void prv_ltc_cs(bool on) /* on=true: CS low */
 {
-    HAL_GPIO_WritePin(ADC_CS_GPIO_Port, ADC_CS_Pin, on ? GPIO_PIN_RESET : GPIO_PIN_SET);
+    HAL_GPIO_WritePin(ADC_CS_GPIO_Port,
+                      ADC_CS_Pin,
+                      on ? GPIO_PIN_RESET : GPIO_PIN_SET);
 }
 
-static bool prv_ltc_read_u16(uint16_t *out)
+static bool prv_ltc_read_u16(uint16_t* out)
 {
     uint8_t rx[2] = {0u, 0u};
     uint8_t tx[2] = {0u, 0u};
+
     prv_ltc_cs(true);
     HAL_StatusTypeDef st = HAL_SPI_TransmitReceive(&hspi1, tx, rx, 2u, 50u);
     prv_ltc_cs(false);
+
     if (st != HAL_OK) {
         return false;
     }
+
     *out = (uint16_t)(((uint16_t)rx[0] << 8) | rx[1]);
     return true;
 }
@@ -671,14 +517,6 @@ static bool prv_ltc_read_u16(uint16_t *out)
 static uint16_t prv_ltc_read_avg(void)
 {
     uint16_t s[UI_NODE_LTC_SAMPLE_COUNT];
-    uint16_t dummy = 0u;
-
-    for (uint32_t i = 0u; i < UI_NODE_LTC_WARMUP_DISCARD_COUNT; i++) {
-        if (!prv_ltc_read_u16(&dummy)) {
-            return 0xFFFFu;
-        }
-        HAL_Delay(40u);
-    }
 
     for (uint32_t i = 0u; i < UI_NODE_LTC_SAMPLE_COUNT; i++) {
         if (!prv_ltc_read_u16(&s[i])) {
@@ -686,38 +524,40 @@ static uint16_t prv_ltc_read_avg(void)
         }
         HAL_Delay(40u);
     }
-    return prv_trimmed_mean_u16(s, UI_NODE_LTC_SAMPLE_COUNT, UI_NODE_LTC_TRIM_COUNT);
-}
-#endif
 
+    return prv_trimmed_mean_u16(s,
+                                UI_NODE_LTC_SAMPLE_COUNT,
+                                UI_NODE_LTC_TRIM_COUNT);
+}
+#endif /* ADC_CS_Pin */
+
+/* -------------------------------------------------------------------------- */
+/* Public API                                                                 */
+/* -------------------------------------------------------------------------- */
 void ND_Sensors_Init(void)
 {
-    s_last_valid_temp_c = UI_NODE_TEMP_INVALID_C;
-    s_last_valid_vdd_x10 = 0xFFFFu;
+    /* ADC_EN 등 초기 상태는 main.c에서 설정됨. */
 }
 
-bool ND_Sensors_MeasureAll(ND_SensorResult_t *out)
+bool ND_Sensors_MeasureAll(ND_SensorResult_t* out)
 {
-    uint16_t vdd_x10 = 0xFFFFu;
+    int16_t temp_x10 = (int16_t)0xFFFF;
     int8_t temp_c = UI_NODE_TEMP_INVALID_C;
-    bool internal_ok = false;
+    uint16_t vdd_x10 = 0xFFFFu;
 
     if (out == NULL) {
         return false;
     }
 
     memset(out, 0, sizeof(*out));
-    /* 내부 온도/VREFINT는 ADC_EN OFF 상태에서 먼저 읽는다.
-     * 최근 수정들에서 ADC_EN ON + ADC 재초기화 경로가 과해지면서
-     * internal sensor가 계속 invalid(-128)로 빠질 수 있어, 원래 안정적이던
-     * 순서를 우선 사용하고 실패 시에만 보조 경로를 시도한다. */
-    prv_set_adc_en(false);
+
+    /* Stop wake 이후에는 ADC/SPI가 DeInit 상태일 수 있음 -> 필요한 것만 Init */
     prv_ensure_adc_init();
-    prv_prepare_internal_adc_channels();
 #if defined(ICM20948_CS_Pin) || defined(ADC_CS_Pin)
     prv_ensure_spi_init();
 #endif
 
+    /* 기본 invalid */
     out->batt_lvl = UI_NODE_BATT_LVL_LOW;
     out->temp_c = UI_NODE_TEMP_INVALID_C;
     out->x = (int16_t)0xFFFFu;
@@ -726,82 +566,65 @@ bool ND_Sensors_MeasureAll(ND_SensorResult_t *out)
     out->adc = 0xFFFFu;
     out->pulse_cnt = UI_GPIO_GetPulseCount();
 
-    /* 1차: 원래 ND 내부 채널 경로(ADC_EN OFF, 긴 sampling). */
-    internal_ok = prv_measure_internal_stable(&vdd_x10, &temp_c);
-
-    /* 2차: 최근 보강한 GW-style/refresh 경로는 보조 수단으로만 사용한다. */
-    if (!internal_ok) {
-        internal_ok = prv_measure_internal_primary(&vdd_x10, &temp_c);
-    }
-    if (!internal_ok) {
-        uint16_t vdd_x10_fb = 0xFFFFu;
-        int8_t temp_c_fb = UI_NODE_TEMP_INVALID_C;
-        if (prv_measure_internal_fallback(&vdd_x10_fb, &temp_c_fb)) {
-            vdd_x10 = vdd_x10_fb;
-            temp_c = temp_c_fb;
-            internal_ok = true;
-        }
+    /*
+     * 1) MCU 내부 온도 / VDD를 가장 먼저 측정한다.
+     *    이 값은 외부 센서 전원(ADC_EN)과 무관하므로, 외부 센서 측정보다 먼저 읽는 것이 맞다.
+     */
+    if (prv_read_temp_x10_internal(&temp_x10) && prv_temp_x10_to_temp_c_checked(temp_x10, &temp_c)) {
+        temp_c = prv_apply_temp_offset_c(temp_c);
+        out->temp_c = temp_c;
+        s_last_valid_temp_c = temp_c;
+    } else if (s_last_valid_temp_c != UI_NODE_TEMP_INVALID_C) {
+        out->temp_c = s_last_valid_temp_c;
     }
 
-    if (!internal_ok) {
-        if (s_last_valid_vdd_x10 != 0xFFFFu) {
-            vdd_x10 = s_last_valid_vdd_x10;
-        }
-        if (s_last_valid_temp_c != UI_NODE_TEMP_INVALID_C) {
-            temp_c = s_last_valid_temp_c;
-            internal_ok = true;
-        }
-    }
-
+    vdd_x10 = prv_read_vdd_x10();
     if ((vdd_x10 != 0xFFFFu) && (vdd_x10 >= UI_NODE_BATT_LOW_THRESHOLD_X10)) {
         out->batt_lvl = UI_NODE_BATT_LVL_NORMAL;
     }
-    out->temp_c = internal_ok ? temp_c : UI_NODE_TEMP_INVALID_C;
 
-    if (internal_ok) {
-        s_last_valid_temp_c = temp_c;
-    }
-    if (vdd_x10 != 0xFFFFu) {
-        s_last_valid_vdd_x10 = vdd_x10;
-    }
-
+    /* 2) ADC_EN: ICM/LTC 전원 */
     prv_set_adc_en(true);
-#if defined(ICM20948_CS_Pin) || defined(ADC_CS_Pin)
-    HAL_Delay(UI_NODE_ADC_POWER_SETTLE_MS);
-#endif
+    HAL_Delay(10u);
 
-#if defined(ADC_CS_Pin)
-    /* 아날로그 샘플은 ICM SPI 트래픽 전에 먼저 읽어서 GW 쪽 값과 시간차를 줄인다. */
-    out->adc = prv_ltc_read_avg();
-#endif
-
+    /* 3) ICM20948 */
 #if defined(ICM20948_CS_Pin)
     if (prv_icm_wakeup() && prv_icm_check_whoami()) {
         int16_t xs[UI_NODE_ICM_SAMPLE_COUNT];
         int16_t ys[UI_NODE_ICM_SAMPLE_COUNT];
         int16_t zs[UI_NODE_ICM_SAMPLE_COUNT];
+
         for (uint32_t i = 0u; i < UI_NODE_ICM_SAMPLE_COUNT; i++) {
             int16_t x = 0;
             int16_t y = 0;
             int16_t z = 0;
+
             if (!prv_icm_read_accel(&x, &y, &z)) {
                 x = (int16_t)0xFFFFu;
                 y = (int16_t)0xFFFFu;
                 z = (int16_t)0xFFFFu;
             }
+
             xs[i] = x;
             ys[i] = y;
             zs[i] = z;
             HAL_Delay(2u);
         }
+
         out->x = prv_trimmed_mean_i16(xs, UI_NODE_ICM_SAMPLE_COUNT, UI_NODE_ICM_TRIM_COUNT);
         out->y = prv_trimmed_mean_i16(ys, UI_NODE_ICM_SAMPLE_COUNT, UI_NODE_ICM_TRIM_COUNT);
         out->z = prv_trimmed_mean_i16(zs, UI_NODE_ICM_SAMPLE_COUNT, UI_NODE_ICM_TRIM_COUNT);
     }
 #endif
 
+    /* 4) LTC2450 */
+#if defined(ADC_CS_Pin)
+    out->adc = prv_ltc_read_avg();
+#endif
+
     prv_set_adc_en(false);
 
+    /* 최소 전류: 측정 종료 후 ADC/SPI도 즉시 정리(필요 시 다시 Ensure로 Init) */
 #if defined(HAL_ADC_MODULE_ENABLED)
     (void)HAL_ADC_DeInit(&hadc);
 #endif
@@ -811,4 +634,3 @@ bool ND_Sensors_MeasureAll(ND_SensorResult_t *out)
 
     return true;
 }
-
