@@ -1,7 +1,9 @@
 #MicroXplorer Configuration settings - do not modify
-ADC.ClockPrescaler=ADC_CLOCK_SYNC_PCLK_DIV4
-ADC.IPParameters=NbrOfConversion,SelectedChannel,ClockPrescaler
+ADC.ClockPrescaler=ADC_CLOCK_ASYNC_DIV64
+ADC.IPParameters=NbrOfConversion,SelectedChannel,ClockPrescaler,SamplingTimeCommon1,SamplingTimeCommon2
 ADC.NbrOfConversion=1
+ADC.SamplingTimeCommon1=ADC_SAMPLETIME_19CYCLES_5
+ADC.SamplingTimeCommon2=ADC_SAMPLETIME_19CYCLES_5
 ADC.SelectedChannel=ADC_CHANNEL_TEMPSENSOR|ADC_CHANNEL_VREFINT
 CAD.formats=
 CAD.pinconfig=
