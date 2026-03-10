@@ -16,6 +16,7 @@ __weak void UI_Hook_OnConfigChanged(void) {}
 __weak void UI_Hook_OnTimeChanged(void) {}
 __weak void UI_Hook_OnBeaconOnceRequested(void) {}
 __weak void UI_Hook_OnBleEndRequested(void) {}
+__weak bool UI_Hook_OnTestStartRequested(void) { return false; }
 
 /* -------------------------------------------------------------------------- */
 static void prv_send_ok(void)
@@ -290,6 +291,20 @@ void UI_Cmd_ProcessLine(const char* line_in)
         /* ND 로컬 테스트/정상 주기 설정 */
         UI_SetSetting(v, unit);
         (void)prv_commit_config_changed();
+        return;
+    }
+
+    /* -------------------- TEST START --------------------- */
+    if (prv_cmd_equals_relaxed(p, "TEST START"))
+    {
+        if (UI_Hook_OnTestStartRequested())
+        {
+            prv_send_ok();
+        }
+        else
+        {
+            prv_send_error();
+        }
         return;
     }
 

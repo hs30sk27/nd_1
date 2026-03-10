@@ -209,6 +209,36 @@ static void prv_power_on_led_blink(void)
     }
 }
 
+static const char* prv_batt_text_from_level(uint8_t batt_lvl)
+{
+    if (batt_lvl == UI_NODE_BATT_LVL_INVALID) {
+        return "-";
+    }
+    return (batt_lvl == UI_NODE_BATT_LVL_NORMAL) ? "3.4" : "LOW";
+}
+
+static void prv_send_test_result_ble(const ND_SensorResult_t* r)
+{
+    const char* batt_text;
+    char msg[192];
+
+    if (r == NULL) {
+        return;
+    }
+
+    batt_text = prv_batt_text_from_level(r->batt_lvl);
+    (void)snprintf(msg, sizeof(msg),
+                   "<TEST START:BATT:%s,T:%d,X:%d,Y:%d,Z:%d,A:%u,P:%lu>\r\n",
+                   batt_text,
+                   (int)r->temp_c,
+                   (int)r->x,
+                   (int)r->y,
+                   (int)r->z,
+                   (unsigned)r->adc,
+                   (unsigned long)r->pulse_cnt);
+    UI_UART_SendString(msg);
+}
+
 static void prv_tmr_boot_cb(void *context)
 {
     (void)context;
@@ -1078,6 +1108,23 @@ void UI_Hook_OnOpKeyPressed(void)
     if (!UI_BLE_IsActive()) {
         prv_led1(false);
     }
+}
+
+bool UI_Hook_OnTestStartRequested(void)
+{
+    ND_SensorResult_t r;
+    bool measure_ok;
+
+    prv_led1(true);
+    UI_BLE_EnableForMs(UI_BLE_ACTIVE_MS);
+    measure_ok = ND_Sensors_MeasureAll(&r);
+    if (measure_ok) {
+        prv_send_test_result_ble(&r);
+    }
+    if (!UI_BLE_IsActive()) {
+        prv_led1(false);
+    }
+    return measure_ok;
 }
 
 void ND_App_Process(void)
